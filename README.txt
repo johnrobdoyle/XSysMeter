@@ -78,24 +78,10 @@ Appearance can be adjusted using XSysMeter* X resources; graph colors are
 currently set in xsysmeter.c. The processor name comes from hw.model.
 Large CPU counts require a large/tall window; there is no scrolling.
 
-VALIDATION
-Source reviewed for C11, Xt callback types, Motif headers, resource types,
-CPU delta accounting, circular history indexing and Xlib redraw lifecycle.
-The delivery environment lacks FreeBSD and Motif/X11 development headers;
-a native compilation and graphical runtime test could not be performed.
-Run the strict build above on FreeBSD 14 and send any diagnostics.
-
 Reference for the FreeBSD accounting interface:
 https://freebsdfoundation.org/wp-content/uploads/2023/01/jones_activitymonitor.pdf
 https://man.freebsd.org/cgi/man.cgi?query=coretemp&sektion=4&manpath=FreeBSD+14.3-RELEASE
 https://man.freebsd.org/cgi/man.cgi?query=amdtemp&sektion=4&manpath=FreeBSD+14.3-RELEASE
-
-MEMORY TRACE IDENTIFICATION
-  Three-pixel strokes and black legend text improve readability.
-  Active: solid blue, circle. Wired: dashed violet, square.
-  Inactive: dotted green, triangle. Swap: dash-dot orange, diamond.
-  Legend swatches match the graph; valid runs end with a marker.
-  Missing readings remain gaps; all values retain their original scale.
 
 STACKED MEMORY VIEW
   Filled RAM history and a current RAM composition bar replace the line view.
