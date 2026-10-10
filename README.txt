@@ -1,4 +1,4 @@
-XSysMeter for FreeBSD 14 - CPU, Temperature and Memory Tabs
+XSysMeter for FreeBSD - CPU, Temperature and Memory Tabs
 ======================
 OpenMotif widgets with a double-buffered Xlib CPU history renderer.
 Inspired by the supplied screenshot: white background, teal traces,
