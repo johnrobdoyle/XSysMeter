@@ -1,8 +1,7 @@
 XSysMeter for FreeBSD - CPU, Temperature and Memory Tabs
 ======================
 OpenMotif widgets with a double-buffered Xlib CPU history renderer.
-Inspired by the supplied screenshot: white background, teal traces,
-four graphs across. Each graph represents a logical CPU (hardware thread),
+Each graph represents a logical CPU (hardware thread),
 not necessarily a separate physical core. All CPUs are discovered at startup.
 
 BUILD
