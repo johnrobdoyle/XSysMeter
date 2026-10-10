@@ -483,7 +483,7 @@ static void show_about(Widget w, XtPointer data, XtPointer call)
         XmString title = XmStringCreateLocalized("About XSysMeter");
         XmString message = XmStringCreateLocalized(
             "XSysMeter 1.0\n"
-            "CPU and Memory Monitor for FreeBSD 14\n\n"
+            "CPU and Memory Monitor for FreeBSD\n\n"
             "OpenMotif controls and Xlib history graphs.\n"
             "CPU Usage: per-logical-CPU utilization.\n"
             "CPU Temperature: available hardware sensors.\n"
