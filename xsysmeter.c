@@ -14,6 +14,8 @@
 #include <Xm/Protocols.h>
 #include <Xm/Notebook.h>
 #include <Xm/MessageB.h>
+#include <Xm/Label.h>
+#include "network.h"
 #include <X11/Shell.h>
 #include <X11/xpm.h>
 #include "meter001.xpm"
@@ -28,9 +30,11 @@
 #include <kvm.h>
 
 #define HISTORY 61
+#define NETWORK_INTERVAL_MS 100
+#define NETWORK_HISTORY 601
 #define COLUMNS 4
 static XtAppContext context;
-static Widget shell, canvases[3], pause_button;
+static Widget shell, canvases[4], pause_button;
 static long *previous, *current;
 static size_t cpu_count, tick_bytes, position, samples;
 static double *history, *temperature;
@@ -52,9 +56,219 @@ static Display *display;
 static GC gc;
 static XFontStruct *font, *heading;
 static unsigned long canvas_background, ink, teal, grid, fill;
-static XtIntervalId timer;
+static XtIntervalId timer, network_timer;
 static Widget about_dialog;
 static Pixmap icon_pixmap = None, icon_mask = None;
+
+static struct network_interface *net_interfaces;
+static size_t net_count, net_selected, net_position, net_samples;
+static struct network_rate net_rate;
+static double net_history[3 * NETWORK_HISTORY];
+static unsigned long net_colors[3], net_fill;
+static char net_status[256] = "Collecting network samples";
+static Widget net_selector;
+
+/* Drawing helper is shared by renderers defined before its implementation. */
+static void text_at(Drawable target, int x, int y, const char *s,
+                    XFontStruct *f, unsigned long pixel);
+
+static void net_format(double value, char *out, size_t size)
+{
+    const char *units[] = {"B/s", "KiB/s", "MiB/s", "GiB/s", "TiB/s"};
+    size_t unit = 0;
+    while (value >= 1024 && unit < 4) { value /= 1024; ++unit; }
+    (void)snprintf(out, size, "%.1f %s", value, units[unit]);
+}
+
+static void net_reset(void)
+{
+    memset(&net_rate, 0, sizeof(net_rate));
+    net_position = net_samples = 0;
+    for (size_t i = 0; i < 3 * NETWORK_HISTORY; ++i) net_history[i] = -1;
+}
+
+static void net_selector_label(void)
+{
+    if (!net_selector) return;
+    XmString label = XmStringCreateLocalized(net_count ? net_interfaces[net_selected].name : "No interfaces");
+    XtVaSetValues(net_selector, XmNlabelString, label, NULL);
+    XmStringFree(label);
+}
+
+static void net_refresh(Widget w, XtPointer data, XtPointer call)
+{
+    struct network_interface *entries = NULL;
+    size_t count = 0;
+    char old[NETWORK_NAME_MAX] = "";
+    (void)w; (void)data; (void)call;
+    if (net_count) (void)snprintf(old, sizeof(old), "%s", net_interfaces[net_selected].name);
+    if (network_interfaces(&entries, &count) == -1) {
+        (void)snprintf(net_status, sizeof(net_status), "Interface discovery failed: %s", strerror(errno));
+        return;
+    }
+    free(net_interfaces);
+    net_interfaces = entries;
+    net_count = count;
+    net_selected = 0;
+    for (size_t i = 0; i < count; ++i)
+        if (entries[i].preferred) { net_selected = i; break; }
+    for (size_t i = 0; i < count; ++i)
+        if (!strcmp(old, entries[i].name)) { net_selected = i; break; }
+    net_reset();
+    net_selector_label();
+    (void)snprintf(net_status, sizeof(net_status), "%s", count ? "Collecting selected interface" : "No interfaces; use Refresh");
+}
+
+static void net_next(Widget w, XtPointer data, XtPointer call)
+{
+    (void)w; (void)data; (void)call;
+    if (net_count) net_selected = (net_selected + 1) % net_count;
+    net_reset();
+    net_selector_label();
+    (void)snprintf(net_status, sizeof(net_status), "Collecting selected interface");
+}
+
+static void sample_network(void)
+{
+    struct network_counters counters;
+    struct timespec now;
+    double rx = -1, tx = -1;
+    if (!net_count) {
+        (void)snprintf(net_status, sizeof(net_status), "No interfaces; use Refresh");
+    } else if (network_read(net_interfaces[net_selected].name, &counters) == -1 ||
+               clock_gettime(CLOCK_MONOTONIC, &now) == -1) {
+        (void)snprintf(net_status, sizeof(net_status), "Interface unavailable: %s (use Refresh if removed)", strerror(errno));
+        net_rate.ready = 0;
+    } else {
+        double timestamp = (double)now.tv_sec + (double)now.tv_nsec / 1000000000.0;
+        int result = network_rate_update(&net_rate, &counters, timestamp);
+        if (result == 1) {
+            rx = net_rate.rx;
+            tx = net_rate.tx;
+            (void)snprintf(net_status, sizeof(net_status), "Interface %s  |  60-second history  |  10 samples/sec  |  bytes per second",
+                net_interfaces[net_selected].name);
+        } else {
+            net_rate.ready = result < 0 ? 0 : net_rate.ready;
+            (void)snprintf(net_status, sizeof(net_status), "Establishing interface counter baseline");
+        }
+    }
+    net_history[net_position] = rx;
+    net_history[NETWORK_HISTORY + net_position] = tx;
+    net_history[2 * NETWORK_HISTORY + net_position] = rx < 0 || tx < 0 ? -1 : rx + tx;
+    net_position = (net_position + 1) % NETWORK_HISTORY;
+    if (net_samples < NETWORK_HISTORY) ++net_samples;
+}
+
+static void render_network(void)
+{
+    static const char *names[3] = {"Receive", "Transmit", "Combined"};
+    Widget canvas = canvases[3];
+    Dimension width, height;
+    char label[256], formatted[40];
+    if (!gc || !XtIsRealized(canvas) || !XtIsManaged(canvas)) return;
+    XtVaGetValues(canvas, XmNwidth, &width, XmNheight, &height, NULL);
+    if (width < 400 || height < 340) return;
+    Pixmap back = XCreatePixmap(display, XtWindow(canvas), width, height,
+        (unsigned int)DefaultDepth(display, DefaultScreen(display)));
+    XSetLineAttributes(display, gc, 1, LineSolid, CapButt, JoinMiter);
+    XSetForeground(display, gc, canvas_background);
+    XFillRectangle(display, back, gc, 0, 0, width, height);
+    text_at(back, 24, 45, "Network Traffic", heading, ink);
+    (void)snprintf(label, sizeof(label), "Interface: %s", net_count ? net_interfaces[net_selected].name : "none");
+    text_at(back, 24, 70, label, font, ink);
+    double maximum = 1024;
+    for (size_t j = 0; j < net_samples; ++j) {
+        size_t index = (net_position + NETWORK_HISTORY - net_samples + j) % NETWORK_HISTORY;
+        if (net_history[2 * NETWORK_HISTORY + index] > maximum) maximum = net_history[2 * NETWORK_HISTORY + index];
+    }
+    maximum *= 1.15;
+    int left = 110, top = 100, plotw = (int)width - 140, ploth = (int)height - 260;
+    /* Light filled area under combined traffic, as in the reference. */
+    for (size_t j = 1; j < net_samples; ++j) {
+        size_t first = (net_position + NETWORK_HISTORY - net_samples + j - 1) % NETWORK_HISTORY;
+        double v1 = net_history[2 * NETWORK_HISTORY + first];
+        double v2 = net_history[2 * NETWORK_HISTORY + (first + 1) % NETWORK_HISTORY];
+        if (v1 < 0 || v2 < 0) continue;
+        int x1 = left + (int)(NETWORK_HISTORY - net_samples + j - 1) * plotw / (NETWORK_HISTORY - 1);
+        int x2 = left + (int)(NETWORK_HISTORY - net_samples + j) * plotw / (NETWORK_HISTORY - 1);
+        XPoint points[4] = {
+            {(short)x1, (short)(top + ploth)},
+            {(short)x1, (short)(top + ploth - (int)(v1 * ploth / maximum))},
+            {(short)x2, (short)(top + ploth - (int)(v2 * ploth / maximum))},
+            {(short)x2, (short)(top + ploth)}
+        };
+        XSetForeground(display, gc, net_fill);
+        XFillPolygon(display, back, gc, points, 4, Convex, CoordModeOrigin);
+    }
+    for (int j = 0; j <= 4; ++j) {
+        int y = top + j * ploth / 4;
+        XSetForeground(display, gc, grid);
+        XDrawLine(display, back, gc, left, y, left + plotw, y);
+        net_format(maximum * (4 - j) / 4, formatted, sizeof(formatted));
+        text_at(back, 6, y + 4, formatted, font, ink);
+    }
+    XSetForeground(display, gc, grid);
+    for (int j = 1; j < 6; ++j)
+        XDrawLine(display, back, gc, left + j * plotw / 6, top, left + j * plotw / 6, top + ploth);
+    for (size_t series = 0; series < 3; ++series) {
+        double sum = 0, peak = 0, current_rate = -1;
+        size_t count = 0;
+        XPoint points[NETWORK_HISTORY];
+        int used = 0;
+        XSetForeground(display, gc, net_colors[series]);
+        XSetLineAttributes(display, gc, 2, LineSolid, CapButt, JoinRound);
+        for (size_t j = 0; j <= net_samples; ++j) {
+            double value = -1;
+            if (j < net_samples) {
+                size_t index = (net_position + NETWORK_HISTORY - net_samples + j) % NETWORK_HISTORY;
+                value = net_history[series * NETWORK_HISTORY + index];
+                if (j + 1 == net_samples) current_rate = value;
+            }
+            if (value < 0) {
+                if (used > 1) XDrawLines(display, back, gc, points, used, CoordModeOrigin);
+                used = 0;
+                continue;
+            }
+            sum += value; ++count;
+            if (value > peak) peak = value;
+            int x = left + (int)(NETWORK_HISTORY - net_samples + j) * plotw / (NETWORK_HISTORY - 1);
+            int y = top + ploth - (int)(value * ploth / maximum);
+            points[used++] = (XPoint){(short)x, (short)y};
+            if (j % 50 == 0 || j + 1 == net_samples)
+                XFillArc(display, back, gc, x - 2, y - 2, 4, 4, 0, 360 * 64);
+        }
+        XSetLineAttributes(display, gc, 1, LineSolid, CapButt, JoinMiter);
+        int y = top + ploth + 55 + (int)series * 25;
+        XSetForeground(display, gc, net_colors[series]);
+        XFillRectangle(display, back, gc, 24, y - 10, 12, 12);
+        char current_text[40], peak_text[40], mean_text[40];
+        if (current_rate >= 0) net_format(current_rate, current_text, sizeof(current_text));
+        else (void)snprintf(current_text, sizeof(current_text), "N/A");
+        net_format(peak, peak_text, sizeof(peak_text));
+        net_format(count ? sum / (double)count : 0, mean_text, sizeof(mean_text));
+        (void)snprintf(label, sizeof(label), "%s: %s   Peak: %s   Avg: %s", names[series], current_text, peak_text, mean_text);
+        text_at(back, 46, y, label, font, ink);
+    }
+    XSetForeground(display, gc, ink);
+    XDrawRectangle(display, back, gc, left, top, (unsigned int)plotw, (unsigned int)ploth);
+    text_at(back, left, top + ploth + 22, "60 seconds ago", font, ink);
+    text_at(back, (int)width - 50, top + ploth + 22, "Now", font, ink);
+    text_at(back, 24, (int)height - 15, paused ? "Paused" : net_status, font, ink);
+    XCopyArea(display, back, XtWindow(canvas), gc, 0, 0, width, height, 0, 0);
+    XFreePixmap(display, back);
+}
+
+static void sample_network_timer(XtPointer data, XtIntervalId *id)
+{
+    (void)data;
+    (void)id;
+    if (!paused) {
+        sample_network();
+        render_network();
+    }
+    network_timer = XtAppAddTimeOut(context, NETWORK_INTERVAL_MS,
+        sample_network_timer, NULL);
+}
 
 static void fatal(const char *s)
 {
@@ -138,9 +352,8 @@ static void render_memory(void)
             XDrawLine(display, back, gc, points[1].x, points[1].y, points[2].x, points[2].y);
         }
     }
-    char dots[2] = {1, 4};
-    XSetLineAttributes(display, gc, 1, LineOnOffDash, CapButt, JoinMiter);
-    XSetDashes(display, gc, 0, dots, 2);
+    /* Draw a continuous grid over the filled memory bands. */
+    XSetLineAttributes(display, gc, 1, LineSolid, CapButt, JoinMiter);
     for (int j = 0; j <= 4; ++j) {
         int y = top + j * ploth / 4;
         XSetForeground(display, gc, grid);
@@ -302,6 +515,7 @@ static void render(void)
     render_page(0);
     render_page(1);
     render_memory();
+    render_network();
 }
 
 static void sample_temperature(void)
@@ -483,12 +697,15 @@ static void show_about(Widget w, XtPointer data, XtPointer call)
         XmString title = XmStringCreateLocalized("About XSysMeter");
         XmString message = XmStringCreateLocalized(
             "XSysMeter 1.0\n"
-            "CPU and Memory Monitor for FreeBSD\n\n"
+            "CPU, Memory and Network Monitor for FreeBSD\n\n"
             "OpenMotif controls and Xlib history graphs.\n"
             "CPU Usage: per-logical-CPU utilization.\n"
             "CPU Temperature: available hardware sensors.\n"
-            "Memory: Active, Wired, Inactive and Swap.\n\n"
-            "History: 60 seconds, sampled every second.\n"
+            "Memory: Active, Wired, Inactive and Swap.\n"
+            "Network: interface receive, transmit and combined rates.\n\n"
+            "History: approximately 60 seconds.\n"
+            "Network: 10 samples per second (100 ms).\n"
+            "CPU, memory and temperature: once per second.\n"
             "Temperature sensors may be shared by cores or packages.");
         Arg args[3];
         Cardinal n = 0;
@@ -523,6 +740,7 @@ static void toggle_pause(Widget w, XtPointer data, XtPointer call)
     XmString s;
     (void)w; (void)data; (void)call;
     paused = !paused;
+    net_rate.ready = 0;
     baseline = True;
     s = XmStringCreateLocalized(paused ? "Resume" : "Pause");
     XtVaSetValues(pause_button, XmNlabelString, s, NULL);
@@ -536,6 +754,7 @@ static void toggle_pause(Widget w, XtPointer data, XtPointer call)
 static void clear_history(Widget w, XtPointer data, XtPointer call)
 {
     (void)w; (void)data; (void)call;
+    net_reset();
     memset(history, 0, cpu_count * HISTORY * sizeof(*history));
     for (size_t i = 0; i < cpu_count * HISTORY; ++i) temperature[i] = -1;
     for (size_t i = 0; i < 6 * HISTORY; ++i) memory_history[i] = -1;
@@ -619,12 +838,31 @@ int main(int argc, char **argv)
         XmNtopAttachment, XmATTACH_FORM, XmNleftAttachment, XmATTACH_FORM,
         XmNrightAttachment, XmATTACH_FORM, XmNbottomAttachment, XmATTACH_WIDGET,
         XmNbottomWidget, toolbar, NULL);
-    for (int page = 0; page < 3; ++page) {
-        canvases[page] = XtVaCreateManagedWidget(page == 2 ? "memory" : page == 1 ? "temperature" : "usage",
-            xmDrawingAreaWidgetClass, notebook,
-            XmNnotebookChildType, XmPAGE, XmNpageNumber, page + 1,
-            XmNwidth, (Dimension)760, XmNheight, (Dimension)(158 + rows * 140), NULL);
-        (void)XtVaCreateManagedWidget(page == 2 ? "Memory" : page == 1 ? "CPU Temperature" : "CPU Usage",
+    for (int page = 0; page < 4; ++page) {
+        if (page == 3) {
+            Widget network_page = XtVaCreateManagedWidget("networkPage", xmFormWidgetClass, notebook,
+                XmNnotebookChildType, XmPAGE, XmNpageNumber, 4, NULL);
+            Widget controls = XtVaCreateManagedWidget("networkControls", xmRowColumnWidgetClass, network_page,
+                XmNorientation, XmHORIZONTAL, XmNpacking, XmPACK_TIGHT,
+                XmNtopAttachment, XmATTACH_FORM, XmNleftAttachment, XmATTACH_FORM,
+                XmNrightAttachment, XmATTACH_FORM, NULL);
+            net_selector = XtVaCreateManagedWidget("Interface", xmLabelWidgetClass, controls, NULL);
+            Widget next = XtVaCreateManagedWidget("Next interface", xmPushButtonWidgetClass, controls, NULL);
+            Widget refresh = XtVaCreateManagedWidget("Refresh", xmPushButtonWidgetClass, controls, NULL);
+            XtAddCallback(next, XmNactivateCallback, net_next, NULL);
+            XtAddCallback(refresh, XmNactivateCallback, net_refresh, NULL);
+            canvases[page] = XtVaCreateManagedWidget("network", xmDrawingAreaWidgetClass, network_page,
+                XmNwidth, (Dimension)760, XmNheight, (Dimension)(158 + rows * 140),
+                XmNtopAttachment, XmATTACH_WIDGET, XmNtopWidget, controls,
+                XmNbottomAttachment, XmATTACH_FORM, XmNleftAttachment, XmATTACH_FORM,
+                XmNrightAttachment, XmATTACH_FORM, NULL);
+        } else {
+            canvases[page] = XtVaCreateManagedWidget(page == 2 ? "memory" : page == 1 ? "temperature" : "usage",
+                xmDrawingAreaWidgetClass, notebook,
+                XmNnotebookChildType, XmPAGE, XmNpageNumber, page + 1,
+                XmNwidth, (Dimension)760, XmNheight, (Dimension)(158 + rows * 140), NULL);
+        }
+        (void)XtVaCreateManagedWidget(page == 3 ? "Network Traffic" : page == 2 ? "Memory" : page == 1 ? "CPU Temperature" : "CPU Usage",
             xmPushButtonWidgetClass, notebook,
             XmNnotebookChildType, XmMAJOR_TAB, XmNpageNumber, page + 1, NULL);
         XtAddCallback(canvases[page], XmNexposeCallback, redraw, NULL);
@@ -649,9 +887,14 @@ int main(int argc, char **argv)
     swap_outline = color("#ffffff", canvas_background);
     memory_colors[4] = color("#e8edf2", ink);
     memory_colors[5] = color("#a799c9", ink);
-    for (int page = 0; page < 3; ++page)
+    for (int page = 0; page < 4; ++page)
         XtVaSetValues(canvases[page], XmNbackground, canvas_background,
                       XmNforeground, ink, NULL);
+    net_colors[0] = color("#007f8b", ink);
+    net_colors[1] = color("#a53b00", ink);
+    net_colors[2] = color("#0052a3", ink);
+    net_fill = color("#91bfe3", canvas_background);
+    net_refresh(NULL, NULL, NULL);
     gc = XCreateGC(display, XtWindow(canvases[0]), 0, NULL);
     font = XLoadQueryFont(display, "-*-helvetica-medium-r-normal--14-*-*-*-*-*-*-*");
     if (!font) font = XLoadQueryFont(display, "fixed");
@@ -662,8 +905,10 @@ int main(int argc, char **argv)
     XtVaSetValues(shell, XmNdeleteResponse, XmDO_NOTHING, NULL);
     XmAddWMProtocolCallback(shell, wm_delete, quit, NULL);
     sample(NULL, NULL);
+    sample_network_timer(NULL, NULL);
     XtAppMainLoop(context);
     XtRemoveTimeOut(timer);
+    XtRemoveTimeOut(network_timer);
     XFreeGC(display, gc);
     if (font) XFreeFont(display, font);
     if (heading) XFreeFont(display, heading);
@@ -672,6 +917,7 @@ int main(int argc, char **argv)
     if (icon_pixmap != None) XFreePixmap(display, icon_pixmap);
     if (icon_mask != None) XFreePixmap(display, icon_mask);
     XtDestroyApplicationContext(context);
+    free(net_interfaces);
     free(previous); free(current); free(history); free(temperature);
     return EXIT_SUCCESS;
 }
